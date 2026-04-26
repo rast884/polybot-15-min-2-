@@ -24,16 +24,50 @@ const TG_TOKEN = process.env.TG_BOT_TOKEN || '';
 const TG_CHAT  = process.env.TG_CHAT_ID   || '';
 let   tgOffset = 0;
 
-async function tgSend(text) {
+async function tgSend(text, extra = {}) {
   if (!TG_TOKEN || !TG_CHAT) return;
   try {
     await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ chat_id: TG_CHAT, text, parse_mode: 'HTML' }),
+      body:    JSON.stringify({ chat_id: TG_CHAT, text, parse_mode: 'HTML', ...extra }),
       timeout: 8000,
     });
   } catch(e) { console.error('[TG]', e.message); }
+}
+
+async function tgSetCommands() {
+  if (!TG_TOKEN) return;
+  try {
+    await fetch(`https://api.telegram.org/bot${TG_TOKEN}/setMyCommands`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        commands: [
+          { command: 'start',  description: '▶️ Запустить бота' },
+          { command: 'stop',   description: '⏹ Остановить бота' },
+          { command: 'status', description: '📊 Баланс и статистика' },
+          { command: 'price',  description: '💲 Цена BTC и время до ставки' },
+          { command: 'reset',  description: '♻️ Сбросить баланс до $100' },
+          { command: 'help',   description: '📖 Список команд' },
+        ]
+      }),
+      timeout: 8000,
+    });
+    console.log('[TG] Commands menu set');
+  } catch(e) { console.error('[TG setCommands]', e.message); }
+}
+
+function fmtCountdown() {
+  const rem = roundId() + ROUND_MS - Date.now();
+  const min = Math.floor(rem / 60000);
+  const sec = Math.floor((rem % 60000) / 1000);
+  return min > 0 ? `${min}м ${sec}с` : `${sec}с`;
+}
+
+function fmtNextBetTime() {
+  const nextRid = roundId() + ROUND_MS;
+  return new Date(nextRid).toLocaleTimeString('ru-RU', { hour:'2-digit', minute:'2-digit', timeZone:'Europe/Moscow' });
 }
 
 async function pollTg() {
@@ -78,27 +112,45 @@ async function handleTgCmd(text) {
     const s = state.stats;
     const total = w.wins + w.losses;
     const wr = total > 0 ? ((w.wins / total) * 100).toFixed(1) : '0.0';
+    const price = Math.round(currentPrice).toLocaleString('ru-RU');
+    const countdown = fmtCountdown();
     await tgSend(
       `📊 <b>Статус бота</b>\n` +
       `${shouldBotRun() ? '🟢 Работает' : _userBotOn ? '🟡 Ждёт расписания' : '🔴 Остановлен'}\n\n` +
-      `💰 Баланс: <b>$${w.balance.toFixed(2)}</b>\n` +
-      `📈 PnL: ${w.pnl >= 0 ? '+' : ''}$${w.pnl.toFixed(2)}\n` +
+      `💲 BTC: <b>${price}</b>\n` +
+      `⏱ До ставки: <b>${countdown}</b>\n\n` +
+      `💰 Баланс: <b>${w.balance.toFixed(2)}</b>\n` +
+      `📈 PnL: ${w.pnl >= 0 ? '+' : ''}${w.pnl.toFixed(2)}\n` +
       `🎯 ${w.wins}W / ${w.losses}L (${wr}% винрейт)\n` +
       `🔥 Серия: ${s.curStreak} | Лучшая: ${s.bestStreak}\n` +
-      `💵 Ставка: $${FIXED_BET} фиксированно\n` +
-      `⏱ Интервал: 15 мин`
+      `💵 Ставка: ${FIXED_BET} фиксированно`
     );
   } else if (text === '/reset' || text === '/сброс') {
     await db.ref('btc15m/command').set('reset');
     await tgSend('♻️ <b>Сброс</b> — баланс $100');
+  } else if (text === '/price' || text === '/цена') {
+    const price = Math.round(currentPrice).toLocaleString('ru-RU');
+    const countdown = fmtCountdown();
+    const nextTime  = fmtNextBetTime();
+    const pending   = state.pendingBet?.result === 'pending';
+    const betInfo   = pending
+      ? `\n\n⏳ <b>Активная ставка:</b> ${state.pendingBet.direction === 'UP' ? '📈 UP' : '📉 DOWN'} ${state.pendingBet.betAmount}\n💲 Вход: ${Math.round(state.pendingBet.startPrice).toLocaleString('ru-RU')}`
+      : '';
+    await tgSend(
+      `💲 <b>BTC/USD: ${price}</b>\n` +
+      `⏱ До следующей ставки: <b>${countdown}</b>\n` +
+      `🕐 Время ставки: ${nextTime} МСК` +
+      betInfo
+    );
   } else if (text === '/help' || text === '/помощь') {
     await tgSend(
-      `🤖 <b>BTC 15m Bot</b>\n\n` +
-      `/start — запустить\n` +
-      `/stop — остановить\n` +
-      `/status — баланс и статистика\n` +
-      `/reset — сброс до $100\n` +
-      `/help — справка`
+      `🤖 <b>BTC 15m Bot — Команды</b>\n\n` +
+      `▶️ /start — запустить бота\n` +
+      `⏹ /stop — остановить бота\n` +
+      `📊 /status — баланс и статистика\n` +
+      `💲 /price — цена BTC и время до ставки\n` +
+      `♻️ /reset — сброс баланса до $100\n` +
+      `📖 /help — этот список`
     );
   }
 }
@@ -600,6 +652,7 @@ async function start() {
   connectPolymarketWS();
   listenForCommands();
   pollTg();
+  tgSetCommands();
   setInterval(tick, 5000);
   setInterval(async () => {
     try {
