@@ -194,15 +194,27 @@ async function loadState() {
   try {
     const snap = await STATE_REF.once('value');
     if (snap.exists()) {
-      const data = snap.val();
-      data.history = (data.history || []).slice(0, 200);
-      _userBotOn   = data.botOn    === true;
-      _skipMode    = data.skipMode !== false;
-      console.log(`[STATE] Баланс: $${data.wallet?.balance} | botOn: ${_userBotOn}`);
+      const raw  = snap.val();
+      const data = mergeWithDefault(raw);
+      _userBotOn = data.botOn    === true;
+      _skipMode  = data.skipMode !== false;
+      console.log(`[STATE] Баланс: $${data.wallet.balance} | botOn: ${_userBotOn}`);
       return data;
     }
   } catch(e) { console.error('[STATE]', e.message); }
   return defaultState();
+}
+
+function mergeWithDefault(data) {
+  const def = defaultState();
+  if (!data) return def;
+  return {
+    ...def,
+    ...data,
+    wallet: { ...def.wallet, ...(data.wallet || {}) },
+    stats:  { ...def.stats,  ...(data.stats  || {}) },
+    history: Array.isArray(data.history) ? data.history.slice(0, 200) : [],
+  };
 }
 
 async function saveState() {
@@ -583,7 +595,8 @@ process.on('uncaughtException',  (e) => console.error('[UncaughtException]',  e?
 async function start() {
   console.log('🤖 BTC 15M Bot starting...');
   state = await loadState();
-  if (!state) { console.error('Firebase load failed'); process.exit(1); }
+  if (!state) state = defaultState();
+  state = mergeWithDefault(state);
   connectPolymarketWS();
   listenForCommands();
   pollTg();
