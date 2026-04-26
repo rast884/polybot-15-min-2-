@@ -221,7 +221,6 @@ let priceBuffer  = [];
 let wsConnected  = false;
 let roundPlaced  = null;
 let _userBotOn   = false;
-let _skipMode    = true;
 
 function defaultState() {
   return {
@@ -229,7 +228,6 @@ function defaultState() {
     stats:       { bestStreak:0, curStreak:0, totalWin:0, totalLoss:0 },
     history:     [],
     botOn:       false,
-    skipMode:    true,
     lastRoundId: null,
     pendingBet:  null,
     savedAt:     Date.now(),
@@ -249,8 +247,7 @@ async function loadState() {
       const raw  = snap.val();
       const data = mergeWithDefault(raw);
       _userBotOn = data.botOn    === true;
-      _skipMode  = data.skipMode !== false;
-      console.log(`[STATE] Баланс: $${data.wallet.balance} | botOn: ${_userBotOn}`);
+          console.log(`[STATE] Баланс: $${data.wallet.balance} | botOn: ${_userBotOn}`);
       return data;
     }
   } catch(e) { console.error('[STATE]', e.message); }
@@ -273,7 +270,6 @@ async function saveState() {
   try {
     state.savedAt  = Date.now();
     state.botOn    = _userBotOn;
-    state.skipMode = _skipMode;
     await STATE_REF.set(state);
   } catch(e) { console.error('[SAVE]', e.message); }
 }
@@ -450,7 +446,7 @@ function aiSignal(klines) {
   if(vol.isFlatMarket){ score*=0.3; signals.push(`Флет⚠$${vol.range}`); }
 
   const absScore = Math.abs(score);
-  const skip     = (_skipMode && absScore < 3.5) || vol.isFlatMarket;
+  const skip     = false; // всегда ставим
   const dir      = score>=0?'UP':'DOWN';
   const conf     = Math.min(87, Math.max(52, 52+absScore*4));
 
@@ -479,18 +475,7 @@ async function placeBet(rid) {
   const klines = await fetchKlines();
   const sig    = aiSignal(klines);
 
-  if (sig.skip) {
-    await log(`⏭ ПРОПУСК ${fmtWindow(rid)} | скор:${sig.score.toFixed(1)}`);
-    state.history.unshift({
-      id:rid, direction:sig.direction, confidence:sig.confidence, reason:sig.reason,
-      betAmount:0, startPrice:currentPrice, endPrice:null, window:fmtWindow(rid),
-      result:'skip', pnl:0, balanceAfter:state.wallet.balance, ts:new Date().toISOString(),
-    });
-    if (state.history.length > 200) state.history = state.history.slice(0,200);
-    state.lastRoundId = rid;
-    await saveState();
-    return;
-  }
+  // skip отключён — ставим каждый раунд
 
   // $5 фиксированно
   state.wallet.balance  = parseFloat((state.wallet.balance - FIXED_BET).toFixed(2));
@@ -606,10 +591,7 @@ function listenForCommands() {
       if (!_userBotOn && state.pendingBet?.result==='pending') await resolveBet();
     }
   });
-  STATE_REF.child('skipMode').on('value', (snap) => {
-    const val = snap.val();
-    if (val!==null && val!==_skipMode) { _skipMode=val; console.log('[CONFIG] skipMode:', _skipMode); }
-  });
+
   db.ref('btc15m/command').on('value', async (snap) => {
     const cmd = snap.val();
     if (cmd==='reset') {
