@@ -111,19 +111,41 @@ async function handleTgCmd(text) {
     const w = state.wallet;
     const s = state.stats;
     const total = w.wins + w.losses;
-    const wr = total > 0 ? ((w.wins / total) * 100).toFixed(1) : '0.0';
+    const wr = total > 0 ? ((w.wins / total) * 100).toFixed(1) : '0';
     const price = Math.round(currentPrice).toLocaleString('ru-RU');
     const countdown = fmtCountdown();
+    const nowMSK = new Date().toLocaleString('ru-RU', { hour:'2-digit', minute:'2-digit', second:'2-digit', timeZone:'Europe/Moscow' });
+    const statusEmoji = shouldBotRun() ? '✅' : _userBotOn ? '🟡' : '🔴';
+    const statusText  = shouldBotRun() ? 'АКТИВЕН' : _userBotOn ? 'ОЖИДАНИЕ' : 'ОСТАНОВЛЕН';
+
+    // Активная ставка
+    let betBlock = '';
+    if (state.pendingBet && state.pendingBet.result === 'pending') {
+      const b = state.pendingBet;
+      const dirEmoji = b.direction === 'UP' ? '▲' : '▼';
+      const dirText  = b.direction === 'UP' ? 'ВВЕРХ' : 'ВНИЗ';
+      const curP = Math.round(currentPrice).toLocaleString('ru-RU');
+      const entryP = Math.round(b.startPrice).toLocaleString('ru-RU');
+      const delta = currentPrice - b.startPrice;
+      const deltaSign = delta >= 0 ? '+' : '';
+      const isWinning = (b.direction === 'UP' && delta >= 0) || (b.direction === 'DOWN' && delta <= 0);
+      const betEmoji = isWinning ? '🟢' : '🔴';
+      betBlock =
+        `\n\n${betEmoji} <b>Активная ставка ${dirEmoji} ${dirText}</b>` +
+        `\n💲 Вход: $${entryP} → Сейчас: $${curP}` +
+        `\n📉 Изменение: ${deltaSign}$${Math.round(Math.abs(delta))} (${deltaSign}${((delta/b.startPrice)*100).toFixed(2)}%)` +
+        `\n⏱ Слот: ${b.window} МСК` +
+        `\n💵 Ставка: $${b.betAmount}`;
+    }
+
     await tgSend(
-      `📊 <b>Статус бота</b>\n` +
-      `${shouldBotRun() ? '🟢 Работает' : _userBotOn ? '🟡 Ждёт расписания' : '🔴 Остановлен'}\n\n` +
-      `💲 BTC: <b>${price}</b>\n` +
-      `⏱ До ставки: <b>${countdown}</b>\n\n` +
-      `💰 Баланс: <b>${w.balance.toFixed(2)}</b>\n` +
-      `📈 PnL: ${w.pnl >= 0 ? '+' : ''}${w.pnl.toFixed(2)}\n` +
-      `🎯 ${w.wins}W / ${w.losses}L (${wr}% винрейт)\n` +
-      `🔥 Серия: ${s.curStreak} | Лучшая: ${s.bestStreak}\n` +
-      `💵 Ставка: ${FIXED_BET} фиксированно`
+      `📊 <b>${nowMSK} МСК</b>\n\n` +
+      `Статус: ${statusEmoji} <b>${statusText}</b>\n` +
+      `BTC: <b>$${price}</b>\n\n` +
+      `💰 $${w.balance.toFixed(2)} · P&L ${w.pnl >= 0 ? '+' : ''}$${w.pnl.toFixed(2)}\n` +
+      `🎯 ${total} ставок · Win rate ${wr}%\n` +
+      `До слота: <b>${countdown}</b>` +
+      betBlock
     );
   } else if (text === '/reset' || text === '/сброс') {
     await db.ref('btc15m/command').set('reset');
