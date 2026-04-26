@@ -1,0 +1,17 @@
+{
+  "name": "btc-15m-bot",
+  "version": "1.0.0",
+  "description": "BTC 15-minute Polymarket bot with Telegram",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "firebase-admin": "^12.0.0",
+    "node-fetch": "^2.7.0",
+    "ws": "^8.17.0"
+  }
+}
