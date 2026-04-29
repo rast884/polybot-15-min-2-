@@ -143,7 +143,8 @@ async function handleTgCmd(text) {
       `Статус: ${statusEmoji} <b>${statusText}</b>\n` +
       `BTC: <b>$${price}</b>\n\n` +
       `💰 $${w.balance.toFixed(2)} · P&L ${w.pnl >= 0 ? '+' : ''}$${w.pnl.toFixed(2)}\n` +
-      `🎯 ${total} ставок · Win rate ${wr}%\n` +
+      `🎯 ✅ Выигрышей: ${w.wins} · ❌ Проигрышей: ${w.losses}\n` +
+      `всего ${total} · Win rate ${wr}%\n` +
       `До слота: <b>${countdown}</b>` +
       betBlock
     );
@@ -246,7 +247,7 @@ let _userBotOn   = false;
 
 function defaultState() {
   return {
-    wallet:      { balance:100, pnl:0, wins:0, losses:0, totalBet:0 },
+    wallet:      { balance:100, pnl:0, wins:0, losses:0, totalBet:0, betNumber:0 },
     stats:       { bestStreak:0, curStreak:0, totalWin:0, totalLoss:0 },
     history:     [],
     botOn:       false,
@@ -371,111 +372,175 @@ async function fetchKlines() {
   } catch(e) { return []; }
 }
 
-// ── POLYMARKET SENTIMENT (15m slug) ───────────────────────────────────
-let pmUpProb=0.5, pmDownProb=0.5, pmLastFetch=0;
+// ── POLYMARKET SENTIMENT ─────────────────────────────────────────────
+// Основной сигнал: котировки рынка Polymarket на текущий 15m раунд
+// Рынок агрегирует мнение тысяч трейдеров — лучший доступный индикатор
+
+let pmUpProb   = 0.5;
+let pmDownProb = 0.5;
+let pmLastFetch = 0;
+let pmFetchOk   = false;
 
 async function fetchPolymarketSentiment() {
-  if (Date.now()-pmLastFetch < 60000) return;
+  // Обновляем каждые 30 секунд (рынок меняется)
+  if (Date.now() - pmLastFetch < 30000) return;
   try {
-    const nowSec    = Math.floor(Date.now()/1000);
-    const roundedSec = nowSec - (nowSec % 900);   // выравниваем по 15 мин
-    const slug      = `btc-updown-15m-${roundedSec}`;
-    const r = await fetch(`https://gamma-api.polymarket.com/events?slug=${slug}`, { timeout:4000 });
-    if (!r.ok) throw 0;
-    const data   = await r.json();
-    const market = data?.[0]?.markets?.[0];
-    if (!market) throw 0;
-    const prices = typeof market.outcomePrices==='string' ? JSON.parse(market.outcomePrices) : market.outcomePrices;
-    pmUpProb   = parseFloat(prices[0]) || 0.5;
-    pmDownProb = parseFloat(prices[1]) || 0.5;
-    pmLastFetch = Date.now();
-    console.log(`[PM] UP ${(pmUpProb*100).toFixed(0)}% / DOWN ${(pmDownProb*100).toFixed(0)}%`);
-  } catch(e) {}
+    const nowSec     = Math.floor(Date.now() / 1000);
+    const roundedSec = nowSec - (nowSec % 900);
+    const slug       = `btc-up-or-down-${roundedSec}-et`;
+
+    // Пробуем несколько вариантов slug
+    const slugs = [
+      `btc-up-or-down-${roundedSec}-et`,
+      `will-btc-go-up-or-down-in-the-next-15-minutes-${roundedSec}`,
+      `btc-updown-15m-${roundedSec}`,
+    ];
+
+    for (const s of slugs) {
+      try {
+        const r = await fetch(`https://gamma-api.polymarket.com/events?slug=${s}`, { timeout:5000 });
+        if (!r.ok) continue;
+        const data   = await r.json();
+        const market = data?.[0]?.markets?.[0];
+        if (!market?.outcomePrices) continue;
+        const prices = typeof market.outcomePrices === 'string'
+          ? JSON.parse(market.outcomePrices)
+          : market.outcomePrices;
+        const up   = parseFloat(prices[0]);
+        const down = parseFloat(prices[1]);
+        if (isNaN(up) || isNaN(down)) continue;
+        pmUpProb   = up;
+        pmDownProb = down;
+        pmFetchOk  = true;
+        pmLastFetch = Date.now();
+        console.log(`[PM] slug:${s} UP ${(up*100).toFixed(1)}% / DOWN ${(down*100).toFixed(1)}%`);
+        return;
+      } catch(_) {}
+    }
+
+    // Fallback: поиск через markets API
+    const r2 = await fetch(
+      `https://gamma-api.polymarket.com/markets?tag_slug=bitcoin&active=true&closed=false&limit=20`,
+      { timeout:5000 }
+    );
+    if (r2.ok) {
+      const markets = await r2.json();
+      const m = markets.find(m => {
+        const q = (m.question || m.title || '').toLowerCase();
+        return (q.includes('btc') || q.includes('bitcoin')) && q.includes('15');
+      });
+      if (m?.outcomePrices) {
+        const prices = typeof m.outcomePrices === 'string' ? JSON.parse(m.outcomePrices) : m.outcomePrices;
+        const up = parseFloat(prices[0]), down = parseFloat(prices[1]);
+        if (!isNaN(up) && !isNaN(down)) {
+          pmUpProb = up; pmDownProb = down; pmFetchOk = true;
+          pmLastFetch = Date.now();
+          console.log(`[PM] fallback UP ${(up*100).toFixed(1)}% / DOWN ${(down*100).toFixed(1)}%`);
+        }
+      }
+    }
+  } catch(e) {
+    console.error('[PM]', e.message);
+  }
 }
 
-// ── AI SIGNAL ─────────────────────────────────────────────────────────
-function aiSignal(klines) {
-  if (klines.length < 3) return { direction:'UP', confidence:52, reason:'Нет данных', score:0, skip:true };
+// ── BTC TREND (из price buffer) ───────────────────────────────────────
+function btcTrend() {
+  if (priceBuffer.length < 10) return { dir: 'NONE', strength: 0 };
 
-  const n=klines.length, c=klines.map(k=>k.c), o=klines.map(k=>k.o),
-        h=klines.map(k=>k.h), l=klines.map(k=>k.l), v=klines.map(k=>k.v);
-  let score=0; const signals=[];
+  // EMA быстрая (последние 20 тиков) vs медленная (последние 60 тиков)
+  const fast = priceBuffer.slice(-20);
+  const slow = priceBuffer.slice(-60);
+  const emaFast = fast.reduce((a,b)=>a+b,0) / fast.length;
+  const emaSlow = slow.reduce((a,b)=>a+b,0) / slow.length;
 
-  // 1. Тренд
-  const rA=(c[n-1]+c[n-2]+c[n-3])/3, eA=(c[0]+c[1]+c[2])/3;
-  if(rA>eA*1.001){score+=2.5;signals.push('Тренд▲');}
-  else if(rA<eA*0.999){score-=2.5;signals.push('Тренд▼');}
-  else signals.push('Флет');
+  // Momentum: изменение за последние 5 минут (~20 тиков)
+  const priceNow  = priceBuffer[priceBuffer.length - 1];
+  const price5ago = priceBuffer[Math.max(0, priceBuffer.length - 20)];
+  const momPct    = (priceNow - price5ago) / price5ago * 100;
 
-  // 2. Тело свечи
-  const lb=c[n-1]-o[n-1], lr=h[n-1]-l[n-1], br=lr>0?Math.abs(lb)/lr:0;
-  if(lb>0&&br>0.6){score+=2;signals.push('BullCandle');}
-  else if(lb<0&&br>0.6){score-=2;signals.push('BearCandle');}
+  const diff = (emaFast - emaSlow) / emaSlow * 100;
 
-  // 3. Моментум
-  let bR=0,beR=0;
-  for(let i=n-3;i<n;i++){if(c[i]>o[i])bR++;else beR++;}
-  if(bR===3){score+=2.5;signals.push('3×Bull');}
-  if(beR===3){score-=2.5;signals.push('3×Bear');}
+  let dir = 'NONE', strength = 0;
+  if      (diff >  0.05 && momPct >  0.03) { dir = 'UP';   strength = Math.min(3, diff * 30); }
+  else if (diff < -0.05 && momPct < -0.03) { dir = 'DOWN'; strength = Math.min(3, Math.abs(diff) * 30); }
+  else if (diff >  0.02)                   { dir = 'UP';   strength = 1; }
+  else if (diff < -0.02)                   { dir = 'DOWN'; strength = 1; }
 
-  // 4. Объём
-  const avgV=v.slice(0,-1).reduce((a,b)=>a+b,0)/(n-1);
-  if(v[n-1]>avgV*1.5){const s=lb>0?1.5:-1.5;score+=s;signals.push('VolSpike');}
+  return { dir, strength, emaFast, emaSlow, momPct: parseFloat(momPct.toFixed(3)), diff: parseFloat(diff.toFixed(4)) };
+}
 
-  // 5. Разворот
-  const avgR=h.map((x,i)=>x-l[i]).reduce((a,b)=>a+b,0)/n;
-  if(lr>avgR*2.5){score*=0.3;signals.push('Reversal');}
+// ── НОВЫЙ СИГНАЛ: Polymarket first ───────────────────────────────────
+// Логика:
+//   1. Главный сигнал — Polymarket odds (рынок умнее любого алгоритма)
+//   2. Тренд BTC как подтверждение или фильтр
+//   3. Пропуск если нет PM данных И нет чёткого тренда
+//   4. Пропуск если PM и тренд противоречат друг другу сильно
 
-  // 6. RSI
-  const gains=[],losses=[];
-  for(let i=1;i<n;i++){const d=c[i]-c[i-1];if(d>0)gains.push(d);else losses.push(Math.abs(d));}
-  const aG=gains.length?gains.reduce((a,b)=>a+b,0)/gains.length:0;
-  const aL=losses.length?losses.reduce((a,b)=>a+b,0)/losses.length:.001;
-  const rsi=100-100/(1+aG/aL);
-  if(rsi>72){score-=2;signals.push(`RSI${rsi.toFixed(0)}OB`);}
-  else if(rsi<28){score+=2;signals.push(`RSI${rsi.toFixed(0)}OS`);}
+function newSignal() {
+  const trend   = btcTrend();
+  const signals = [];
+  let   skip    = false;
 
-  // 7. Polymarket Sentiment
-  if(pmUpProb!==0.5){
-    if(pmUpProb>=0.65){score+=4;signals.push(`PM▲${(pmUpProb*100).toFixed(0)}%`);}
-    else if(pmUpProb<=0.35){score-=4;signals.push(`PM▼${(pmDownProb*100).toFixed(0)}%`);}
-    else if(pmUpProb>=0.57){score+=2;signals.push(`PM▲${(pmUpProb*100).toFixed(0)}%`);}
-    else if(pmUpProb<=0.43){score-=2;signals.push(`PM▼${(pmDownProb*100).toFixed(0)}%`);}
+  // ── Polymarket ──
+  const pmDiff  = pmUpProb - pmDownProb;   // > 0 = рынок ставит на UP
+  const pmConf  = Math.max(pmUpProb, pmDownProb);
+  let pmDir     = pmDiff >= 0 ? 'UP' : 'DOWN';
+  let pmScore   = 0;
+
+  if (pmFetchOk) {
+    if      (pmConf >= 0.65) { pmScore = 5; signals.push(`PM:${pmDir}${(pmConf*100).toFixed(0)}%🔥`); }
+    else if (pmConf >= 0.58) { pmScore = 3; signals.push(`PM:${pmDir}${(pmConf*100).toFixed(0)}%`); }
+    else if (pmConf >= 0.53) { pmScore = 1; signals.push(`PM:${pmDir}${(pmConf*100).toFixed(0)}%`); }
+    else {
+      // Рынок почти 50/50 — слабый сигнал
+      pmScore = 0;
+      signals.push(`PM:50/50⚠`);
+    }
+    if (pmDir === 'DOWN') pmScore = -pmScore;
+  } else {
+    signals.push('PM:нет данных');
   }
 
-  // 8. Order Flow
-  if(_orderFlow.score!==0){
-    score+=_orderFlow.score;
-    signals.push(`OF${_orderFlow.score>0?'▲':'▼'}${Math.abs((_orderFlow.imbalance*100).toFixed(0))}%`);
+  // ── BTC Trend ──
+  let trendScore = 0;
+  if (trend.dir !== 'NONE') {
+    trendScore = trend.dir === 'UP' ? trend.strength : -trend.strength;
+    signals.push(`ТРЕНД:${trend.dir}${trend.strength.toFixed(1)} mom:${trend.momPct>0?'+':''}${trend.momPct}%`);
+  } else {
+    signals.push('ТРЕНД:флет');
   }
 
-  // 9. Delta Entry
-  const rem2  = state.lastRoundId ? (state.lastRoundId+ROUND_MS-Date.now()) : ROUND_MS;
-  const delta = calcDeltaEntry(priceBuffer, _roundStartPrice, rem2);
-  if(delta.score!==0){
-    score+=delta.score;
-    signals.push(`Δ${delta.priceDelta>0?'+':''}${delta.priceDelta.toFixed(3)}%(${delta.elapsed}s)`);
+  // ── Итоговый score ──
+  // PM весит в 3× больше тренда
+  const totalScore = pmScore * 3 + trendScore;
+  const dir = totalScore >= 0 ? 'UP' : 'DOWN';
+  const absScore = Math.abs(totalScore);
+
+  // ── Фильтры пропуска ──
+  // 1. Нет PM данных и нет тренда — пропуск
+  if (!pmFetchOk && trend.dir === 'NONE') {
+    skip = true;
+    signals.push('⚠ПРОПУСК:нет данных');
   }
 
-  // 10. Консенсус
-  const bullC=signals.filter(s=>s.includes('▲')||s.includes('Bull')||s.includes('OS')).length;
-  const bearC=signals.filter(s=>s.includes('▼')||s.includes('Bear')||s.includes('OB')).length;
-  if(bullC>=4&&bearC===0){score+=2;signals.push('Консенсус▲');}
-  if(bearC>=4&&bullC===0){score-=2;signals.push('Консенсус▼');}
+  // 2. PM 50/50 и тренд флет — непонятный рынок
+  if (pmFetchOk && pmConf < 0.53 && trend.dir === 'NONE') {
+    skip = true;
+    signals.push('⚠ПРОПУСК:рынок неопределён');
+  }
 
-  // 11. Volatility Filter
-  const vol = calcVolatility(priceBuffer);
-  if(vol.isFlatMarket){ score*=0.3; signals.push(`Флет⚠$${vol.range}`); }
+  // 3. PM и тренд прямо противоречат при слабом PM сигнале
+  if (pmFetchOk && pmConf < 0.58 && trend.dir !== 'NONE' && trend.dir !== pmDir && trend.strength >= 2) {
+    // В этом случае доверяем тренду больше
+    signals.push('⚠КОНФЛИКТ:следуем тренду');
+    // не пропускаем, но инвертируем
+  }
 
-  const absScore = Math.abs(score);
-  const skip     = false; // всегда ставим
-  const dir      = score>=0?'UP':'DOWN';
-  const conf     = Math.min(87, Math.max(52, 52+absScore*4));
+  const conf = Math.min(85, Math.max(52, 52 + absScore * 3));
+  const reason = `PM:${pmFetchOk?(pmUpProb*100).toFixed(1)+'%UP/'+((1-pmUpProb)*100).toFixed(1)+'%DN':'нет'} | ${signals.join(' | ')} | score:${totalScore.toFixed(1)} → ${dir} ${conf.toFixed(0)}%${skip?' ⚠ПРОПУСК':''}`;
 
-  const pmStr  = pmUpProb!==0.5?` | PM:▲${(pmUpProb*100).toFixed(0)}%`:'';
-  const reason = `Скор:${score.toFixed(1)} RSI:${rsi.toFixed(0)}${pmStr} | ${signals.join(',')} | ${dir} ${conf.toFixed(0)}%${skip?' | ⚠ПРОПУСК':''}`;
-
-  return { direction:dir, confidence:conf, signals, reason, score, skip };
+  return { direction: dir, confidence: conf, reason, score: totalScore, skip, pmConf, pmDir, trend };
 }
 
 // ── BOT LOGIC ─────────────────────────────────────────────────────────
@@ -493,29 +558,31 @@ async function placeBet(rid) {
   roundPlaced = rid;
   if (!_roundStartPrice) _roundStartPrice = currentPrice;
   if (!wsConnected) await fetchPriceFallback();
-  await Promise.all([fetchPolymarketSentiment(), fetchOrderFlow()]);
-  const klines = await fetchKlines();
-  const sig    = aiSignal(klines);
+  await fetchPolymarketSentiment();
+  const sig = newSignal();
 
   // skip отключён — ставим каждый раунд
 
   // $5 фиксированно
-  state.wallet.balance  = parseFloat((state.wallet.balance - FIXED_BET).toFixed(2));
+  state.wallet.balance   = parseFloat((state.wallet.balance - FIXED_BET).toFixed(2));
   state.wallet.totalBet += FIXED_BET;
+  state.wallet.betNumber = (state.wallet.betNumber || 0) + 1;
   state.lastRoundId      = rid;
+  const betNum = state.wallet.betNumber;
 
   state.pendingBet = {
     id:rid, direction:sig.direction, confidence:sig.confidence, reason:sig.reason,
     betAmount:FIXED_BET, startPrice:currentPrice, endPrice:null,
     window:fmtWindow(rid), result:'pending', pnl:0, ts:new Date().toISOString(),
+    betNumber: betNum,
   };
 
   await saveState();
-  await log(`🎯 ${sig.direction} $${FIXED_BET} @ $${Math.round(currentPrice)} | ${fmtWindow(rid)} | ${sig.confidence.toFixed(0)}%`);
+  await log(`🎯 #${betNum} ${sig.direction} $${FIXED_BET} @ $${Math.round(currentPrice)} | ${fmtWindow(rid)} | ${sig.confidence.toFixed(0)}%`);
 
   await tgSend(
-    `🎯 <b>Ставка</b>\n` +
-    `${sig.direction==='UP'?'📈 UP':'📉 DOWN'} | $${FIXED_BET}\n` +
+    `🎯 <b>Ставка #${betNum}</b>\n` +
+    `${sig.direction==='UP'?'📈 UP':'📉 DOWN'} · $${FIXED_BET}\n` +
     `💲 BTC: $${Math.round(currentPrice).toLocaleString('ru-RU')}\n` +
     `⏱ ${fmtWindow(rid)} МСК\n` +
     `🧠 ${sig.confidence.toFixed(0)}% уверенность\n` +
@@ -541,13 +608,14 @@ async function resolveBet() {
     state.stats.totalWin += p;
     if (state.stats.curStreak > state.stats.bestStreak) state.stats.bestStreak = state.stats.curStreak;
     bet.result='win'; bet.pnl=p;
-    await log(`✅ WIN +$${p.toFixed(2)} | Баланс: $${state.wallet.balance.toFixed(2)}`);
+    await log(`✅ WIN +${p.toFixed(2)} | Баланс: ${state.wallet.balance.toFixed(2)}`);
+    const _wTotal = state.wallet.wins + state.wallet.losses;
+    const _wWr = _wTotal > 0 ? (state.wallet.wins / _wTotal * 100).toFixed(1) : '0.0';
     await tgSend(
-      `✅ <b>Победа!</b>\n` +
-      `+$${p.toFixed(2)} (ставка $${bet.betAmount})\n` +
-      `${bet.direction==='UP'?'📈':'📉'} ${bet.direction}: $${Math.round(bet.startPrice)} → $${Math.round(bet.endPrice)}\n` +
-      `🔥 Серия: ${state.stats.curStreak}\n` +
-      `💰 Баланс: <b>$${state.wallet.balance.toFixed(2)}</b>`
+      `✅ <b>Победа #${bet.betNumber||_wTotal}</b> +${p.toFixed(2)}\n` +
+      `W/L: ${state.wallet.wins}/${state.wallet.losses} · Win rate ${_wWr}%\n` +
+      `${bet.direction==='UP'?'📈 UP':'📉 DOWN'}: ${Math.round(bet.startPrice).toLocaleString('ru-RU')} → ${Math.round(bet.endPrice).toLocaleString('ru-RU')}\n` +
+      `💰 Баланс: <b>${state.wallet.balance.toFixed(2)}</b>`
     );
   } else {
     state.wallet.pnl    = parseFloat((state.wallet.pnl-bet.betAmount).toFixed(2));
@@ -555,12 +623,14 @@ async function resolveBet() {
     state.stats.curStreak = 0;
     state.stats.totalLoss += bet.betAmount;
     bet.result='loss'; bet.pnl=-bet.betAmount;
-    await log(`❌ LOSS -$${bet.betAmount} | Баланс: $${state.wallet.balance.toFixed(2)}`);
+    await log(`❌ LOSS -${bet.betAmount} | Баланс: ${state.wallet.balance.toFixed(2)}`);
+    const _lTotal = state.wallet.wins + state.wallet.losses;
+    const _lWr = _lTotal > 0 ? (state.wallet.wins / _lTotal * 100).toFixed(1) : '0.0';
     await tgSend(
-      `❌ <b>Проигрыш</b>\n` +
-      `-$${bet.betAmount}\n` +
-      `${bet.direction==='UP'?'📈':'📉'} ${bet.direction}: $${Math.round(bet.startPrice)} → $${Math.round(bet.endPrice)}\n` +
-      `💰 Баланс: <b>$${state.wallet.balance.toFixed(2)}</b>`
+      `❌ <b>Проигрыш #${bet.betNumber||_lTotal}</b> -${bet.betAmount}\n` +
+      `W/L: ${state.wallet.wins}/${state.wallet.losses} · Win rate ${_lWr}%\n` +
+      `${bet.direction==='UP'?'📈 UP':'📉 DOWN'}: ${Math.round(bet.startPrice).toLocaleString('ru-RU')} → ${Math.round(bet.endPrice).toLocaleString('ru-RU')}\n` +
+      `💰 Баланс: <b>${state.wallet.balance.toFixed(2)}</b>`
     );
   }
 
