@@ -519,15 +519,21 @@ function newSignal() {
 
   // ── Фильтры пропуска ──
   // 1. Нет PM данных и нет тренда — пропуск
-  if (!pmFetchOk && trend.dir === 'NONE') {
+  if (!pmFetchOk) {
     skip = true;
-    signals.push('⚠ПРОПУСК:нет данных');
+    signals.push('⚠ПРОПУСК:нет PM данных');
   }
 
   // 2. PM 50/50 и тренд флет — непонятный рынок
-  if (pmFetchOk && pmConf < 0.53 && trend.dir === 'NONE') {
+  // Пропуск если PM слабый (< 57%) И тренд флет
+  if (pmFetchOk && pmConf < 0.57 && trend.dir === 'NONE') {
     skip = true;
-    signals.push('⚠ПРОПУСК:рынок неопределён');
+    signals.push('⚠ПРОПУСК:PM<57%+флет');
+  }
+  // Пропуск если PM вообще 50/50 (< 53%) независимо от тренда
+  if (pmFetchOk && pmConf < 0.53) {
+    skip = true;
+    signals.push('⚠ПРОПУСК:PM~50/50');
   }
 
   // 3. PM и тренд прямо противоречат при слабом PM сигнале
@@ -556,12 +562,46 @@ async function placeBet(rid) {
   }
 
   roundPlaced = rid;
+
+  // Стоп-серия: пауза на 2 раунда после 3 проигрышей подряд
+  const recentLosses = (state.history || [])
+    .filter(h => h.result === 'win' || h.result === 'loss')
+    .slice(0, 3);
+  const allLosses = recentLosses.length === 3 && recentLosses.every(h => h.result === 'loss');
+  if (allLosses && state.stats.curStreak === 0) {
+    const lastLossTime = recentLosses[0]?.ts ? new Date(recentLosses[0].ts).getTime() : 0;
+    const pauseMs = 2 * ROUND_MS; // пауза 2 раунда = 30 минут
+    if (Date.now() - lastLossTime < pauseMs) {
+      await log(`⏸ ПАУЗА после 3 проигрышей подряд | ${fmtWindow(rid)}`);
+      await tgSend(`⏸ <b>Пауза 30 мин</b> — 3 проигрыша подряд\n⏱ Следующая ставка: ${fmtNextBetTime()}`);
+      return;
+    }
+  }
+
   if (!_roundStartPrice) _roundStartPrice = currentPrice;
   if (!wsConnected) await fetchPriceFallback();
   await fetchPolymarketSentiment();
   const sig = newSignal();
 
-  // skip отключён — ставим каждый раунд
+  // Пропуск если сигнал слабый
+  if (sig.skip) {
+    await log(`⏭ ПРОПУСК ${fmtWindow(rid)} | ${sig.reason.slice(0,80)}`);
+    await tgSend(
+      `⏭ <b>Пропуск раунда</b>\n` +
+      `⏱ ${fmtWindow(rid)} МСК\n` +
+      `📊 PM: UP ${(pmUpProb*100).toFixed(0)}% / DOWN ${(pmDownProb*100).toFixed(0)}%\n` +
+      `❓ Причина: слабый сигнал (PM~50/50)`
+    );
+    state.history.unshift({
+      id:rid, direction:sig.direction, confidence:sig.confidence, reason:sig.reason,
+      betAmount:0, startPrice:currentPrice, endPrice:null, window:fmtWindow(rid),
+      result:'skip', pnl:0, balanceAfter:state.wallet.balance, ts:new Date().toISOString(),
+    });
+    if (state.history.length > 200) state.history = state.history.slice(0,200);
+    state.lastRoundId = rid;
+    await saveState();
+    return;
+  }
 
   // $5 фиксированно
   state.wallet.balance   = parseFloat((state.wallet.balance - FIXED_BET).toFixed(2));
